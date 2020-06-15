@@ -1,51 +1,14 @@
-using ForwardDiff
-using FFTW
-
-function hartley(u::Vector{T}) where T<:Real
-	v = fft(real.(u))
-	return real.(v) .+ imag.(v)
-end
-
-function hartley(u::Vector{T}) where T<:Complex
-	v_r = fft(real.(u))
-	v_i = fft(imag.(u))
-	return real.(v_r) .+ imag.(v_r) .+ (real.(v_i) .+ imag.(v_i)) * im
-end
-
-function hartley!(o::Vector{T}, u::Vector{T}) where T<:Real
-	v = fft(real.(u))
-	o .= real.(v) .+ imag.(v)
-end
-
-function hartley!(o::Vector{T}, u::Vector{T}) where T<:Complex
-	v_r = fft(real.(u))
-	v_i = fft(imag.(u))
-	o .= real.(v_r) .+ imag.(v_r) .+ (real.(v_i) .+ imag.(v_i)) * im
-end
-
-function hartley(u::Vector{ForwardDiff.Dual{T,V,P}}) where {T,V,P}
-	# Unpack AoS -> SoA
-	vs = vec(ForwardDiff.value.(u))
-	ps = vec(mapreduce(ForwardDiff.partials, hcat, u))
-	# Actual computation
-	val = hartley(vs)
-	jvp = hartley(ps)
-	# Pack SoA -> AoS (depending on jvp, might need `eachrow`)
-	return map((v, p) -> ForwardDiff.Dual{T}(v, p...), val, jvp)
-end
-
-# Modulo some factors hartley = ihartley
-ihartley(u) = 1 ./ dims .* hartley(u)
-
-
 import IterativeSolvers: cg
 import Random: randn
 import ForwardDiff
-using LinearMaps
-using LinearAlgebra
+import FFTW: plan_r2r, DHT
+import Base: *
+using ForwardDiff
 using Zygote
-using Plots
+using LinearAlgebra
+using LinearMaps
 using Statistics: mean
+using Plots
 
 dims = (1024)
 
@@ -53,13 +16,40 @@ dims = (1024)
 ξ_truth = randn(dims)
 k = [i < dims / 2 ? i :  dims-i for i = 0:dims-1]
 
+# Define the harmonic transform operator as a matrix-like object
+ht = plan_r2r(zeros(dims), DHT)
+# Unfortunately neither Zygote nor ForwardDiff support planned Hartley
+# transformations. While Zygote does not support AbstractFFTs.ScaledPlan,
+# ForwardDiff does not overload the appropriate methods from AbstractFFTs.
+# TODO: Push those changes to upstream. At the very least, Zygote is open to it
+function *(trafo::typeof(ht), u::Vector{ForwardDiff.Dual{T,V,P}}) where {T,V,P}
+	# Unpack AoS -> SoA
+	vs = ForwardDiff.value.(u)
+	ps = mapreduce(ForwardDiff.partials, vcat, u)
+	# Actual computation
+	val = trafo * vs
+	jvp = trafo * ps
+	# Pack SoA -> AoS (depending on jvp, might need `eachrow`)
+	return map((v, p) -> ForwardDiff.Dual{T}(v, p...), val, jvp)
+end
+Zygote.@adjoint function *(trafo::typeof(inv(ht)), xs)
+	return trafo * xs, Δ -> (nothing, trafo * Δ)
+end
+Zygote.@adjoint function inv(trafo::typeof(ht))
+	inv_t = inv(trafo)
+	return inv_t, function (Δ)
+		adj_inv_t = adjoint(inv_t)
+		return (- adj_inv_t * Δ * adj_inv_t, )
+	end
+end
+
 power = @. 50 / (k^2.5 + 1)
-draw_sample(ξ) = real(ihartley(power .* hartley(ξ)))
+draw_sample(ξ) = inv(ht) * (power .* (ht * ξ))
 signal(ξ) = exp.(draw_sample(ξ))
 
 N = Diagonal(0.1^2 * ones(dims))
 R = ones(dims)
-R[100:200] .= 0
+#R[100:200] .= 0
 R = Diagonal(R)
 
 # Generate synthetic signal and data
@@ -76,38 +66,44 @@ ham(ξ) = nll(ξ) + sum(ξ.^2)
 # Metric of the given energy (here a Gaussian one)
 M = N^-1
 
-function val_vjp(ξ, δ_ξ)
-	val, back = Zygote.pullback(signal_response, ξ)
-	return val, first(back(δ_ξ))
+function jacobian(f, ξ)
+	to_dual(δ) = map((v, p) -> ForwardDiff.Dual(v, p...), ξ, δ)
+	jvp(δ) = mapreduce(ForwardDiff.partials, vcat, f(to_dual(δ)))
+
+	vjp(δ) = first(Zygote.pullback(f, ξ)[2](δ))
+
+	return LinearMap{eltype(ξ)}(jvp, vjp, first(size(ξ)))
 end
 
-function val_jvp(ξ, δ_ξ)
-	dls = map((v, p) -> ForwardDiff.Dual(v, p...), ξ, δ_ξ)
-	v_jvp = signal_response(dls)
-	vs = ForwardDiff.value.(v_jvp)
-	ps = mapreduce(ForwardDiff.partials, hcat, v_jvp)
-	return vs, vec(ps)
-end
-
-function lcl_fisher(ξ_bar)
-	nll_fish(ξ) = transpose(val_vjp(ξ_bar, M * val_jvp(ξ_bar, ξ)[2])[2])
+function local_fisher(jac)
+	nll_fish(ξ) = adjoint(jac) * M * jac * ξ
 	return LinearMap(nll_fish, dims) + I
 end
 
-function implicit_covariance_sample(cov_inv, ξ_bar)
+function implicit_covariance_sample(cov_inv, jac)
     ξ_new = randn(dims)
-	d_new = val_jvp(ξ_bar, ξ_new)[2] .+ R * sqrt(M^-1) * randn(dims)
-	j_new = val_vjp(ξ_bar, M * d_new)[2]
+	d_new = jac * ξ_new .+ R * sqrt(M^-1) * randn(dims)
+	j_new = adjoint(jac) * M * d_new
 	m_new = cg(cov_inv, j_new, log=true)[1]
     return ξ_new - m_new
 end
 
-function mgvi!(pos, n_smpls; nat_grad_scl=1.)
-	fish = lcl_fisher(pos)
+function mgvi!(pos, n_samples; nat_grad_scl=1., mirror_samples=false)
+	jac = jacobian(signal_response, pos)
+	fish = local_fisher(jac)
 	println("sampling...")
-	smpls = [implicit_covariance_sample(fish, pos) for i = 1 : n_smpls]
+	smpls = [implicit_covariance_sample(fish, jac) for i = 1 : n_samples]
+
 	println("minimizing...")
-	kl(ξ) = mean(ham(ξ + s) for s in smpls)
+	if mirror_samples
+		kl(ξ) = reduce(+, ham(ξ + s) + ham(ξ - s) for s in smpls) / (2 * n_samples)
+		n_eff_smpls = 2 * n_samples
+	else
+		kl(ξ) = reduce(+, ham(ξ + s) for s in smpls) / n_samples
+		n_eff_smpls = n_samples
+	end
+
+	# TODO: take metric of KL itself, i.e. the averaged one
 	Δξ = cg(fish, first(gradient(kl, pos)), log=true)[1]
 	println("computing natural gradient...")
 	pos .-= nat_grad_scl * Δξ
@@ -118,9 +114,12 @@ init_pos = 0.1 * randn(dims)
 
 n_samples = 3
 pos = copy(init_pos)
+# Warm up in a region where the gradient is not yet very meaningful
+samples = mgvi!(pos, 1; nat_grad_scl=1e-2, mirror_samples=true)[2]
+samples = mgvi!(pos, 1; nat_grad_scl=1e-1, mirror_samples=true)[2]
 for i in 1:10
 	global pos, samples
-	samples = mgvi!(pos, 4; nat_grad_scl=1.)[2]
+	samples = mgvi!(pos, n_samples; nat_grad_scl=1.; mirror_samples=true)[2]
 	#plot!(signal(pos), label="it. " * string(i))
 end
 
