@@ -30,7 +30,7 @@ mutable struct Energy{T<:Function}
 	curvature::Union{LinearMap,AbstractMatrix,Nothing}
 end
 
-function jacobian(f::T where T<:Function, ξ::V) where V
+function jacobian(f::T where T<:Function, ξ::V) where V<:Union{<:Number,Vector{<:Number}}
 	to_dual(δ::V) = map((v, p) -> ForwardDiff.Dual(v, p...), ξ, δ)
 	jvp(δ::V) = mapreduce(ForwardDiff.partials, vcat, f(to_dual(δ)))
 
@@ -89,7 +89,15 @@ function metric_gaussian_kl(
 	samples = mirror_samples ? vcat(samples, -samples) : samples
 	kl(ξ::T) = reduce(+, ham(ξ + s) for s in samples) / length(samples)
 
-	return Energy(kl, pos, samples, fisher)
+	# Take the metric of the KL itself as curvature
+	nll_fisher_by_s = []
+	for s in samples
+		jac_s = standard_ham.nll_with_metric.jac_at(pos + s)
+		nll_fisher_by_s = vcat(nll_fisher_by_s, adjoint(jac_s) * metric * jac_s)
+	end
+	avg_fisher = (reduce(+, nll_fisher_by_s)) / length(samples) + I
+
+	return Energy(kl, pos, samples, avg_fisher)
 end
 
 function max_posterior(standard_ham::StandardHamiltonian, pos)
@@ -137,9 +145,9 @@ Zygote.@adjoint function inv(trafo::typeof(ht))
 	end
 end
 
-power = @. 50 / (k^2.5 + 1)
-draw_sample(ξ) = inv(ht) * (power .* ξ)
-signal(ξ) = exp.(draw_sample(ξ))
+P = Diagonal(@. 50 / (k^2.5 + 1))
+draw_sample(ξ::T where T) = inv(ht) * (P * ξ)
+signal(ξ::T where T) = exp.(draw_sample(ξ))
 
 N = Diagonal(0.1^2 * ones(dims))
 R = ones(dims)
@@ -152,7 +160,7 @@ d = R * ss .+ R * sqrt(N) * randn(dims)
 plot(ss, color=:red, label="ground truth", linewidt=5)
 #plot!(d, seriestype=:scatter, marker=:x, color=:black)
 
-signal_response(ξ) = R * signal(ξ)
+signal_response(ξ::T where T) = R * signal(ξ)
 # Negative log-likelihood assuming a Gaussian energy
 ge = gaussian_energy(N, d, signal_response)
 ham = standard_hamiltonian(ge)
