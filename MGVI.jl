@@ -138,7 +138,7 @@ Zygote.@adjoint function inv(trafo::typeof(ht))
 end
 
 power = @. 50 / (k^2.5 + 1)
-draw_sample(ξ) = inv(ht) * (power .* (ht * ξ))
+draw_sample(ξ) = inv(ht) * (power .* ξ)
 signal(ξ) = exp.(draw_sample(ξ))
 
 N = Diagonal(0.1^2 * ones(dims))
@@ -161,11 +161,16 @@ n_samples = 3
 init_pos = 0.1 * randn(dims)
 pos = copy(init_pos)
 mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
+minimize!(mgkl; nat_grad_scl=1e-3)
+mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
 minimize!(mgkl; nat_grad_scl=1e-2)
-for i in 1 : 3
-	global pos, mgkl
-	pos .= mgkl.position
-	mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
+mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
+minimize!(mgkl; nat_grad_scl=1e-2)
+for i in 1 : 10
+	global mgkl
+	println("Sampling...")
+	mgkl = metric_gaussian_kl(ham, mgkl.position, n_samples; mirror_samples=true)
+	println("Minimizing...")
 	minimize!(mgkl; nat_grad_scl=1.)
 end
 
