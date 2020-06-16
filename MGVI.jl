@@ -105,7 +105,6 @@ function max_posterior(standard_ham::StandardHamiltonian, pos)
 end
 
 function minimize!(energy::Energy{T}; nat_grad_scl=1.) where T
-	# TODO: take metric of KL itself, i.e. the averaged one
 	Δξ = cg(energy.curvature, first(gradient(energy.potential, energy.position)), log=true)[1]
 	energy.position .-= nat_grad_scl * Δξ
 	return energy

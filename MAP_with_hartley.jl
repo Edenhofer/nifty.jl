@@ -73,7 +73,7 @@ signal_response(ξ) = R * signal(ξ)
 nll(ξ) = sum(inv(N) * (d .- signal_response(ξ)).^2)
 ham(ξ) = nll(ξ) + sum(ξ.^2)
 
-function ∂ham!(ξ_storage, ξ)
+function ∂ham!(ξ_storage::T, ξ::T) where T
 	ξ_storage .= first(Zygote.gradient(ham, ξ))
 end
 
