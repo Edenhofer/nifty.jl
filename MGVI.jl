@@ -23,10 +23,16 @@ struct StandardHamiltonian{T}
 	nll_with_metric::NegLogLikelihoodWithMetric{T}
 end
 
-mutable struct Energy{T, L<:Union{Nothing,Array{T}}, N<:Union{Nothing,AbstractMatrix,LinearMap}}
+mutable struct Energy{
+	T,
+	L<:Union{Nothing,Vector{T}},
+	G<:Union{Nothing,T},
+	N<:Union{Nothing,AbstractMatrix,LinearMap}
+}
 	potential::F where F<:Function
 	position::T
 	samples::L
+	gradient::G
 	curvature::N
 end
 
@@ -87,6 +93,7 @@ function metric_gaussian_kl(
 	# TODO: convert samples to an iteration that can be mirrored
 	samples = mirror_samples ? vcat(samples, -samples) : samples
 	kl(ξ::P) = reduce(+, ham(ξ + s) for s in samples) / length(samples)
+	grad::P = first(gradient(kl, pos))
 
 	# Take the metric of the KL itself as curvature
 	nll_fisher_by_s = mapreduce(+, samples) do s
@@ -95,16 +102,26 @@ function metric_gaussian_kl(
 	end
 	avg_fisher = nll_fisher_by_s / length(samples) + I
 
-	return Energy(kl, pos, samples, avg_fisher)
+	return Energy(kl, pos, samples, grad, avg_fisher)
 end
 
-function max_posterior(standard_ham::StandardHamiltonian, pos)
-	return Energy(standard_ham.nll_plus_prior, pos, nothing, nothing)
+function maximum_posterior(standard_ham::StandardHamiltonian, pos::P) where P
+	return Energy(standard_ham.nll_plus_prior, pos, nothing, nothing, nothing)
 end
 
-function minimize!(energy::Energy{T}; nat_grad_scl=1) where T
-	Δξ = cg(energy.curvature, first(gradient(energy.potential, energy.position)), log=true)[1]
+function minimize!(energy::Energy{P}; nat_grad_scl=1) where P
+	Δξ = cg(energy.curvature, energy.gradient, log=true)[1]
 	energy.position .-= nat_grad_scl * Δξ
+	return energy
+end
+
+function minimize!(energy::Energy{P,Nothing,Nothing}) where P
+	function ∂pot!(ξ_storage::P, ξ::P)
+		ξ_storage .= first(gradient(energy.potential, ξ))
+	end
+
+	opt = optimize(energy.potential, ∂pot!, energy.position, LBFGS())
+	energy.position .= Optim.minimizer(opt)
 	return energy
 end
 
@@ -162,21 +179,25 @@ signal_response(ξ::T where T) = R * signal(ξ)
 ge = gaussian_energy(N, d, signal_response)
 ham = standard_hamiltonian(ge)
 
-n_samples = 3
 init_pos = 0.1 * randn(dims)
+
 pos = copy(init_pos)
+# Maximum a Posteriori
+maxap = maximum_posterior(ham, pos)
+minimize!(maxap)
+plot!(signal(maxap.position), label="MAP", color=:blue)
+
+pos = copy(init_pos)
+n_samples = 3
+# Metric Gaussian Variational Inference
 mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
-minimize!(mgkl; nat_grad_scl=1e-3)
-mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
-minimize!(mgkl; nat_grad_scl=1e-2)
-mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
-minimize!(mgkl; nat_grad_scl=1e-2)
-for i in 1 : 10
+minimize!(mgkl; nat_grad_scl=1e-1)
+for i in 1 : 3
 	global mgkl
 	println("Sampling...")
 	mgkl = metric_gaussian_kl(ham, mgkl.position, n_samples; mirror_samples=true)
 	println("Minimizing...")
-	minimize!(mgkl; nat_grad_scl=1.)
+	minimize!(mgkl; nat_grad_scl=.5)
 end
 
 for (i, s) in enumerate(mgkl.samples)
