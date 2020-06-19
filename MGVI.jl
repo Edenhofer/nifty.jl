@@ -12,6 +12,8 @@ using Plots
 
 using Optim
 
+VecOrNum = Union{Number,Vector{<:Number}}
+
 struct NegLogLikelihoodWithMetric{T<:Union{AbstractMatrix,LinearMap}}
 	nll::F where F<:Function
 	metric::T
@@ -36,11 +38,19 @@ mutable struct Energy{
 	curvature::N
 end
 
-function jacobian(f::F, ξ::V) where {F<:Function, V<:Union{Number,Vector{<:Number}}}
-	to_dual(δ::V) = map((v, p) -> ForwardDiff.Dual(v, p...), ξ, δ)
+function to_dual_at(ξ::V) where V<:VecOrNum
+	return function to_dual(δ::V)
+		return map((v, p) -> ForwardDiff.Dual(v, p...), ξ, δ)
+	end
+end
+
+function jacobian(f::F, ξ::V) where {F<:Function, V<:VecOrNum}
+	to_dual = to_dual_at(ξ)
 	jvp(δ::V) = mapreduce(ForwardDiff.partials, vcat, f(to_dual(δ)))
 
-	vjp(δ::V) = first(Zygote.pullback(f, ξ)[2](δ))
+	function vjp(δ::T) where T<:VecOrNum
+		return first(Zygote.pullback(f, ξ)[2](δ))
+	end
 
 	return LinearMap{eltype(ξ)}(jvp, vjp, first(size(ξ)))
 end
@@ -63,17 +73,21 @@ function gaussian_energy(noise_cov::T, data::V, signal_response::F) where {
 	F<:Function
 } where E
 	inv_noise_cov = inv(noise_cov)
-	function nll(ξ::V)
+	function nll(ξ::L) where L<:VecOrNum
 		res = data .- signal_response(ξ)
 		return transpose(res) * inv_noise_cov * res
 	end
-	jac_at(ξ::V) = jacobian(signal_response, ξ)
+	function jac_at(ξ::L) where L<:VecOrNum
+		return jacobian(signal_response, ξ)
+	end
 
 	return NegLogLikelihoodWithMetric(nll, inv_noise_cov, jac_at)
 end
 
 function standard_hamiltonian(nll_w_metric::NegLogLikelihoodWithMetric{T}) where T
-	nll_plus_pr(ξ::T where T) = nll_w_metric.nll(ξ) + 0.5 * (ξ ⋅ ξ)
+	function nll_plus_pr(ξ::L) where L<:VecOrNum
+		return nll_w_metric.nll(ξ) + 0.5 * (ξ ⋅ ξ)
+	end
 	return StandardHamiltonian(nll_plus_pr, nll_w_metric)
 end
 
@@ -127,9 +141,6 @@ end
 
 
 dims = (1024)
-
-# ξ := latent variables
-ξ_truth = randn(dims)
 k = [i < dims / 2 ? i :  dims-i for i = 0:dims-1]
 
 # Define the harmonic transform operator as a matrix-like object
@@ -159,14 +170,27 @@ Zygote.@adjoint function inv(trafo::typeof(ht))
 	end
 end
 
-P = Diagonal(@. 50 / (k^2.5 + 1))
-draw_sample(ξ::T where T) = inv(ht) * (P * ξ)
-signal(ξ::T where T) = exp.(draw_sample(ξ))
+# ξ := latent variables
+ξ_truth = randn(dims)
+conf = Dict{String,VecOrNum}("loglogavgslope_mean"=>2., "loglogavgslope_stddev"=>0.5)
+
+loglogslope = conf["loglogavgslope_stddev"] .* randn() .+ conf["loglogavgslope_mean"]
+P = @. 50 / (k^loglogslope + 1)
+function correlated_field(ξ::V) where V<:VecOrNum
+	return inv(ht) * (P .* ξ)
+end
+function signal(ξ::V) where V<:VecOrNum
+	return exp.(correlated_field(ξ))
+end
 
 N = Diagonal(0.01^2 * ones(dims))
 R = ones(dims)
 #R[100:200] .= 0
 R = Diagonal(R)
+
+function signal_response(ξ::V) where V<:VecOrNum
+	return R * signal(ξ)
+end
 
 # Generate synthetic signal and data
 ss = signal(ξ_truth)
@@ -174,7 +198,6 @@ d = R * ss .+ R * sqrt(N) * randn(dims)
 plot(ss, color=:red, label="ground truth", linewidt=5)
 plot!(d, seriestype=:scatter, marker=:x, color=:black)
 
-signal_response(ξ::T where T) = R * signal(ξ)
 # Negative log-likelihood assuming a Gaussian energy
 ge = gaussian_energy(N, d, signal_response)
 ham = standard_hamiltonian(ge)
