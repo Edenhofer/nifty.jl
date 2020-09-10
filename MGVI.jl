@@ -28,13 +28,11 @@ end
 mutable struct Energy{
 	T,
 	L<:Union{Nothing,Vector{T}},
-	G<:Union{Nothing,T},
 	N<:Union{Nothing,AbstractMatrix,LinearMap}
 }
 	potential::F where F<:Function
 	position::T
 	samples::L
-	gradient::G
 	curvature::N
 end
 
@@ -102,12 +100,11 @@ function metric_gaussian_kl(
 	fisher = adjoint(jac) * metric * jac + I
 
 	samples = [covariance_sample(fisher, jac, metric) for i = 1 : n_samples]
-
-	ham = standard_ham.nll_plus_prior
 	# TODO: convert samples to an iteration that can be mirrored
 	samples = mirror_samples ? vcat(samples, -samples) : samples
+
+	ham = standard_ham.nll_plus_prior
 	kl(ξ::P) = reduce(+, ham(ξ + s) for s in samples) / length(samples)
-	grad::P = first(gradient(kl, pos))
 
 	# Take the metric of the KL itself as curvature
 	nll_fisher_by_s = mapreduce(+, samples) do s
@@ -116,16 +113,19 @@ function metric_gaussian_kl(
 	end
 	avg_fisher = nll_fisher_by_s / length(samples) + I
 
-	return Energy(kl, pos, samples, grad, avg_fisher)
+	return Energy(kl, pos, samples, avg_fisher)
 end
 
 function maximum_posterior(standard_ham::StandardHamiltonian, pos::P) where P
-	return Energy(standard_ham.nll_plus_prior, pos, nothing, nothing, nothing)
+	return Energy(standard_ham.nll_plus_prior, pos, nothing, nothing)
 end
 
-function minimize!(energy::Energy{P}; nat_grad_scl=1) where P
-	Δξ = cg(energy.curvature, energy.gradient, log=true)[1]
-	energy.position .-= nat_grad_scl * Δξ
+function minimize!(energy::Energy{P}; nat_grad_steps=15, nat_grad_scl=1) where P
+	for _ in 1 : nat_grad_steps
+		grad = first(gradient(energy.potential, energy.position))
+		Δξ = cg(energy.curvature, grad, log=true)[1]
+		energy.position .-= nat_grad_scl * Δξ
+	end
 	return energy
 end
 
@@ -204,13 +204,13 @@ ham = standard_hamiltonian(ge)
 
 init_pos = 0.1 * randn(dims)
 
-pos = copy(init_pos)
+pos = deepcopy(init_pos)
 # Maximum a Posteriori
 maxap = maximum_posterior(ham, pos)
 minimize!(maxap)
 plot!(signal(maxap.position), label="MAP", color=:blue)
 
-pos = copy(init_pos)
+pos = deepcopy(init_pos)
 n_samples = 3
 # Metric Gaussian Variational Inference
 mgkl = metric_gaussian_kl(ham, pos, n_samples; mirror_samples=true)
