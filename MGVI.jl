@@ -73,7 +73,7 @@ function gaussian_energy(noise_cov::T, data::V, signal_response::F) where {
 	inv_noise_cov = inv(noise_cov)
 	function nll(ξ::L) where L<:VecOrNum
 		res = data .- signal_response(ξ)
-		return transpose(res) * inv_noise_cov * res
+		return 0.5 * transpose(res) * inv_noise_cov * res
 	end
 	function jac_at(ξ::L) where L<:VecOrNum
 		return jacobian(signal_response, ξ)
